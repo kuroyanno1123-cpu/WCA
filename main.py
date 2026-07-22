@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import random
 import argparse
 import datetime
@@ -75,6 +76,28 @@ os.makedirs(args.outfolder, exist_ok=True)
 sys.stdout = Logger(osp.join(args.outfolder, 'logs.txt'))
 
 
+# ── CSV helpers ───────────────────────────────────────────────────────────────
+
+def _csv_init(path):
+    if not osp.exists(path):
+        with open(path, 'w', newline='') as f:
+            csv.writer(f).writerow(
+                ['epoch', 'lr', 'loss_total', 'loss_ce', 'loss_jsd', 'test_acc']
+            )
+
+
+def _csv_append(path, epoch, lr, losses, acc):
+    with open(path, 'a', newline='') as f:
+        csv.writer(f).writerow([
+            epoch,
+            f'{lr:.8f}',
+            f'{losses["total"]:.6f}',
+            f'{losses["ce"]:.6f}',
+            f'{losses["jsd"]:.6f}' if losses['jsd'] is not None else '',
+            f'{acc:.5f}'           if acc is not None             else '',
+        ])
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -98,6 +121,8 @@ def main():
     from model.resnet import ResNet18
     net = ResNet18(num_classes=10)
     net = torch.nn.DataParallel(net).cuda()
+    n_params = sum(p.numel() for p in net.parameters())
+    print(f'Parameters: {n_params:,}')
 
     file_name = (
         f'{args.model}_{args.dataset}_{args.aug}'
@@ -128,6 +153,8 @@ def main():
                                 momentum=0.9, nesterov=True, weight_decay=5e-4)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 190], gamma=0.2)
 
+    csv_path   = osp.join(args.outfolder, 'history.csv')
+    _csv_init(csv_path)
     best_acc   = 0.0
     start_time = time.time()
 
@@ -135,9 +162,14 @@ def main():
         t0 = time.time()
         print(f'==> Epoch {epoch + 1}/{args.max_epoch}')
 
-        loss_all = _train_epoch(net, optimizer, train_loader)
-        print(f'epoch_loss: {loss_all}')
+        losses = _train_epoch(net, optimizer, train_loader)
+        if losses['jsd'] is not None:
+            print(f'epoch_loss: {losses["total"]:.6f}  '
+                  f'CE: {losses["ce"]:.6f}  JSD(pre-λ): {losses["jsd"]:.6f}')
+        else:
+            print(f'epoch_loss: {losses["total"]:.6f}')
 
+        acc        = None
         eval_start = int(args.max_epoch * 0.6)
         if epoch >= eval_start or epoch == args.max_epoch - 1:
             print('==> Test')
@@ -149,7 +181,9 @@ def main():
                 save_networks(net, args.outfolder, file_name)
 
         scheduler.step()
-        print(f'epoch_time(min): {(time.time() - t0) // 60}')
+        lr_now = scheduler.get_last_lr()[0]
+        print(f'lr: {lr_now:.6f}  epoch_time(min): {(time.time() - t0) // 60}')
+        _csv_append(csv_path, epoch + 1, lr_now, losses, acc)
 
     elapsed = str(datetime.timedelta(seconds=round(time.time() - start_time)))
     print(f'Finished. Total elapsed time (h:m:s): {elapsed}')
@@ -158,7 +192,9 @@ def main():
 
 def _train_epoch(net, optimizer, loader):
     net.train()
-    meter = AverageMeter()
+    meter     = AverageMeter()
+    meter_ce  = AverageMeter()
+    meter_jsd = AverageMeter()
 
     if args.jsd_lambda > 0:
         # ── JSD モード ───────────────────────────────────────────────────────
@@ -174,17 +210,24 @@ def _train_epoch(net, optimizer, loader):
             logits = net(torch.cat([x_clean, x_aug1, x_aug2], dim=0))
             l_clean, l_aug1, l_aug2 = torch.split(logits, bs, dim=0)
 
-            loss = F.cross_entropy(l_clean, targets) + \
-                   args.jsd_lambda * jsd_loss(l_clean, l_aug1, l_aug2)
+            loss_ce  = F.cross_entropy(l_clean, targets)
+            loss_jsd = jsd_loss(l_clean, l_aug1, l_aug2)
+            loss     = loss_ce + args.jsd_lambda * loss_jsd
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            meter.update(loss.item(), bs)
+            meter.update(loss.item(),         bs)
+            meter_ce.update(loss_ce.item(),   bs)
+            meter_jsd.update(loss_jsd.item(), bs)
             if (batch_idx + 1) % args.print_freq == 0:
                 print(f'Batch {batch_idx + 1}/{len(loader)}\t'
-                      f'Loss {meter.val:.6f} ({meter.avg:.6f})')
+                      f'Loss {meter.val:.6f} ({meter.avg:.6f})  '
+                      f'CE {meter_ce.val:.6f} ({meter_ce.avg:.6f})  '
+                      f'JSD {meter_jsd.val:.6f} ({meter_jsd.avg:.6f})')
+
+        return {'total': meter.avg, 'ce': meter_ce.avg, 'jsd': meter_jsd.avg}
 
     else:
         # ── CE-only モード ───────────────────────────────────────────────────
@@ -205,7 +248,7 @@ def _train_epoch(net, optimizer, loader):
                 print(f'Batch {batch_idx + 1}/{len(loader)}\t'
                       f'Loss {meter.val:.6f} ({meter.avg:.6f})')
 
-    return meter.avg
+        return {'total': meter.avg, 'ce': meter.avg, 'jsd': None}
 
 
 if __name__ == '__main__':
