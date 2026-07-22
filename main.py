@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import argparse
 import datetime
 import time
@@ -62,6 +63,7 @@ parser.add_argument('--eval', type=str, default='none', choices=['none', 'eval']
 parser.add_argument('--workers',    type=int, default=16)
 parser.add_argument('--gpu',        type=str, default='0')
 parser.add_argument('--print-freq', type=int, default=100)
+parser.add_argument('--seed',       type=int, default=0)
 
 args = parser.parse_args()
 
@@ -76,11 +78,16 @@ sys.stdout = Logger(osp.join(args.outfolder, 'logs.txt'))
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     assert torch.cuda.is_available(), 'CUDA not available'
     cudnn.benchmark = True
 
-    print(f'GPU: {args.gpu}')
+    print(f'GPU: {args.gpu}  seed={args.seed}')
     print(f'aug={args.aug}  source={args.source}  target={args.target}  '
           f'level={args.level}  swap_prob={args.swap_prob}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}')
@@ -131,7 +138,8 @@ def main():
         loss_all = _train_epoch(net, optimizer, train_loader)
         print(f'epoch_loss: {loss_all}')
 
-        if epoch > 150:
+        eval_start = int(args.max_epoch * 0.6)
+        if epoch >= eval_start or epoch == args.max_epoch - 1:
             print('==> Test')
             acc = test(net, test_loader)
             print(f'accuracy: {acc}')
@@ -150,8 +158,7 @@ def main():
 
 def _train_epoch(net, optimizer, loader):
     net.train()
-    meter    = AverageMeter()
-    loss_all = 0.0
+    meter = AverageMeter()
 
     if args.jsd_lambda > 0:
         # ── JSD モード ───────────────────────────────────────────────────────
@@ -178,7 +185,6 @@ def _train_epoch(net, optimizer, loader):
             if (batch_idx + 1) % args.print_freq == 0:
                 print(f'Batch {batch_idx + 1}/{len(loader)}\t'
                       f'Loss {meter.val:.6f} ({meter.avg:.6f})')
-            loss_all += meter.avg
 
     else:
         # ── CE-only モード ───────────────────────────────────────────────────
@@ -198,9 +204,8 @@ def _train_epoch(net, optimizer, loader):
             if (batch_idx + 1) % args.print_freq == 0:
                 print(f'Batch {batch_idx + 1}/{len(loader)}\t'
                       f'Loss {meter.val:.6f} ({meter.avg:.6f})')
-            loss_all += meter.avg
 
-    return loss_all
+    return meter.avg
 
 
 if __name__ == '__main__':

@@ -57,6 +57,8 @@ class CIFAR10TrainDataset(Dataset):
     """
 
     def __init__(self, root, wca_aug, jsd_mode=False, aug_order='wca_first', download=True):
+        if jsd_mode and wca_aug is None:
+            raise ValueError('--aug none と --jsd-lambda > 0 の組み合わせは未対応です。')
         self._raw     = _RawCIFAR10(root, train=True, download=download)
         self.wca_aug  = wca_aug
         self.jsd_mode = jsd_mode
