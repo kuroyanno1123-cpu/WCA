@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 from PIL import Image
 
@@ -121,6 +122,12 @@ class CIFAR10CDataset(Dataset):
         return _TO_TENSOR_NORM(img), int(self.targets[idx])
 
 
+def _worker_init_fn(worker_id):
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed + worker_id)
+    np.random.seed(seed + worker_id)
+
+
 def build_loaders(args, eval_mode=False):
     from core.wca import WaveletBasisSwap
 
@@ -142,7 +149,8 @@ def build_loaders(args, eval_mode=False):
     test_ds  = CIFAR10TestDataset(data_root)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.workers, pin_memory=True)
+                              num_workers=args.workers, pin_memory=True,
+                              worker_init_fn=_worker_init_fn)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False,
                               num_workers=args.workers, pin_memory=True)
 
