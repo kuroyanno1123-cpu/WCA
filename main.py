@@ -61,16 +61,22 @@ parser.add_argument('--model', type=str, default='resnet18')
 parser.add_argument('--eval', type=str, default='none', choices=['none', 'eval'])
 
 # misc
-parser.add_argument('--workers',    type=int, default=16)
-parser.add_argument('--gpu',        type=str, default='0')
-parser.add_argument('--print-freq', type=int, default=100)
-parser.add_argument('--seed',       type=int, default=0)
+parser.add_argument('--workers',    type=int,   default=16)
+parser.add_argument('--gpu',        type=str,   default='0')
+parser.add_argument('--print-freq', type=int,   default=100)
+parser.add_argument('--seed',       type=int,   default=0)
+parser.add_argument('--grad-clip',  type=float, default=None,
+                    help='gradient clipping max norm. Default: 1.0 in JSD mode, None in CE mode.')
 
 args = parser.parse_args()
 
 # ── Aug-order default: wca_first for CE, crop_first for JSD ──────────────────
 if args.aug_order is None:
     args.aug_order = 'crop_first' if args.jsd_lambda > 0 else 'wca_first'
+
+# ── Grad-clip default: 1.0 in JSD mode ───────────────────────────────────────
+if args.grad_clip is None and args.jsd_lambda > 0:
+    args.grad_clip = 1.0
 
 os.makedirs(args.outfolder, exist_ok=True)
 sys.stdout = Logger(osp.join(args.outfolder, 'logs.txt'))
@@ -113,7 +119,7 @@ def main():
     print(f'GPU: {args.gpu}  seed={args.seed}')
     print(f'aug={args.aug}  source={args.source}  target={args.target}  '
           f'level={args.level}  swap_prob={args.swap_prob}')
-    print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}')
+    print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')
     train_loader, test_loader, corruption_loaders = build_loaders(args, eval_mode=eval_mode)
@@ -216,6 +222,8 @@ def _train_epoch(net, optimizer, loader):
 
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             optimizer.step()
 
             meter.update(loss.item(),         bs)
@@ -241,6 +249,8 @@ def _train_epoch(net, optimizer, loader):
 
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             optimizer.step()
 
             meter.update(loss.item(), targets.size(0))
