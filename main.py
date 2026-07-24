@@ -32,7 +32,7 @@ parser.add_argument('--memo',    type=str, default='none')
 
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
-                    choices=['wca', 'none'], help='augmentation type')
+                    choices=['wca', 'augmix', 'none'], help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
 parser.add_argument('--level',     type=int,   default=1,      help='DWT decomposition level')
@@ -117,8 +117,11 @@ def main():
     cudnn.benchmark = True
 
     print(f'GPU: {args.gpu}  seed={args.seed}')
-    print(f'aug={args.aug}  source={args.source}  target={args.target}  '
-          f'level={args.level}  swap_prob={args.swap_prob}')
+    if args.aug == 'wca':
+        print(f'aug={args.aug}  source={args.source}  target={args.target}  '
+              f'level={args.level}  swap_prob={args.swap_prob}')
+    else:
+        print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')

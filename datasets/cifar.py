@@ -129,18 +129,20 @@ def _worker_init_fn(worker_id):
 
 
 def build_loaders(args, eval_mode=False):
-    from core.wca import WaveletBasisSwap
-
     data_root = os.path.join(args.data, 'cifar10')
 
     wca_aug = None
     if args.aug == 'wca':
+        from core.wca import WaveletBasisSwap
         wca_aug = WaveletBasisSwap(
             source_wavelet=args.source,
             target_wavelet=args.target,
             level=args.level,
             swap_prob=args.swap_prob,
         )
+    elif args.aug == 'augmix':
+        from torchvision.transforms import AugMix
+        wca_aug = AugMix()  # severity=3, mixture_width=3, chain_depth=-1
 
     jsd_mode  = (args.jsd_lambda > 0)
     aug_order = args.aug_order
