@@ -41,6 +41,9 @@ parser.add_argument('--aug-order', type=str,   default=None,
                     choices=['wca_first', 'crop_first'],
                     help='Preprocessing order. '
                          'Default: wca_first when --jsd-lambda 0, crop_first otherwise.')
+parser.add_argument('--basis-random', action='store_true', default=False,
+                    help='Randomize (source, target) wavelet pair per sample from BASIS_POOL. '
+                         'Requires --aug wca. Ignores --source/--target when enabled.')
 
 # loss
 parser.add_argument('--jsd-lambda', type=float, default=12.0,
@@ -118,8 +121,13 @@ def main():
 
     print(f'GPU: {args.gpu}  seed={args.seed}')
     if args.aug == 'wca':
-        print(f'aug={args.aug}  source={args.source}  target={args.target}  '
-              f'level={args.level}  swap_prob={args.swap_prob}')
+        if args.basis_random:
+            from core.wca import BASIS_POOL
+            print(f'aug=wca  basis_random=True  pool={BASIS_POOL}  '
+                  f'level={args.level}  swap_prob={args.swap_prob}')
+        else:
+            print(f'aug={args.aug}  source={args.source}  target={args.target}  '
+                  f'level={args.level}  swap_prob={args.swap_prob}')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')

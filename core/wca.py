@@ -20,35 +20,56 @@ import numpy as np
 import pywt
 from PIL import Image
 
+# --basis-random モードで使用する基底プール（pywt + level=1 + 32x32 で動作確認済み）
+BASIS_POOL = ["haar", "db4", "db8", "sym4", "sym8", "coif2"]
+
 
 class WaveletBasisSwap:
     """WBS: Wavelet Basis Swap Augmentation（単一画像）
     Haar で分解後、各HF係数（LH, HL, HH）を独立にswap_probの確率でdb4基底で再構成。
-    LLは常にHaarで再構成（低周波保護）。
+    LLは常にsource_waveletで再構成（低周波保護）。
     レベルLなら3L個のHF係数がそれぞれ独立にswapされる。
+
+    basis_random=True のとき、__call__ ごとに BASIS_POOL からランダムに
+    (source, target) を選ぶ（source != target を保証）。
+    _last_pair に最後に使ったペアを記録する。
     """
 
     def __init__(self, source_wavelet='haar', target_wavelet='db4',
-                 level=1, swap_prob=0.5, mode='periodization'):
+                 level=1, swap_prob=0.5, mode='periodization',
+                 basis_random=False, basis_pool=None):
         self.source_wavelet = source_wavelet
         self.target_wavelet = target_wavelet
         self.level = level
         self.swap_prob = swap_prob
         self.mode = mode
+        self.basis_random = basis_random
+        self.basis_pool = basis_pool if basis_pool is not None else BASIS_POOL
+        self._last_pair = None  # (src, tgt) — basis_random=True のときのみ更新
 
-    def _process_channel(self, channel):
+    def _pick_pair(self, avoid_pair=None):
+        """basis_pool からランダムに (src, tgt) を選ぶ。
+        src != tgt、かつ avoid_pair と一致しない組み合わせを引き直す。"""
+        pool = self.basis_pool
+        while True:
+            src = random.choice(pool)
+            tgt = random.choice(pool)
+            if src != tgt and (src, tgt) != avoid_pair:
+                return src, tgt
+
+    def _process_channel(self, channel, src_w, tgt_w):
         h, w = channel.shape
-        coeffs = pywt.wavedec2(channel, wavelet=self.source_wavelet,
+        coeffs = pywt.wavedec2(channel, wavelet=src_w,
                                level=self.level, mode=self.mode)
 
         cA = coeffs[0]
         detail_levels = coeffs[1:]
         zeros_cA = np.zeros_like(cA)
 
-        # LL: 常にsource_waveletで再構成（固定）
+        # LL: 常にsrc_wで再構成（低周波保護）
         zeros_details = [(np.zeros_like(d[0]), np.zeros_like(d[1]), np.zeros_like(d[2]))
                          for d in detail_levels]
-        result = pywt.waverec2([cA] + zeros_details, wavelet=self.source_wavelet, mode=self.mode)
+        result = pywt.waverec2([cA] + zeros_details, wavelet=src_w, mode=self.mode)
 
         # 各レベルの各HF係数（LH, HL, HH）を独立にswap
         for lvl_i, (LH, HL, HH) in enumerate(detail_levels):
@@ -56,7 +77,7 @@ class WaveletBasisSwap:
                  for d in detail_levels]
 
             for coef_i, coef in enumerate([LH, HL, HH]):
-                w_use = self.target_wavelet if random.random() < self.swap_prob else self.source_wavelet
+                w_use = tgt_w if random.random() < self.swap_prob else src_w
 
                 details = [list(z[i]) for i in range(len(detail_levels))]
                 details[lvl_i][coef_i] = coef
@@ -67,13 +88,20 @@ class WaveletBasisSwap:
 
         return result[:h, :w]
 
-    def __call__(self, img_pil):
+    def __call__(self, img_pil, avoid_pair=None):
+        if self.basis_random:
+            src_w, tgt_w = self._pick_pair(avoid_pair)
+            self._last_pair = (src_w, tgt_w)
+        else:
+            src_w = self.source_wavelet
+            tgt_w = self.target_wavelet
+
         img = np.array(img_pil).astype(np.float64)
         h, w = img.shape[:2]
 
         result = np.zeros_like(img, dtype=np.float64)
         for c in range(img.shape[2]):
-            result[:, :, c] = self._process_channel(img[:, :, c])
+            result[:, :, c] = self._process_channel(img[:, :, c], src_w, tgt_w)
 
         return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 

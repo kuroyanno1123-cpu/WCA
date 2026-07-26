@@ -87,12 +87,21 @@ class CIFAR10TrainDataset(Dataset):
             if self.aug_order == 'crop_first':
                 base    = _BASIC_AUG(img)                      # 共有ベース
                 x_clean = _TO_TENSOR_NORM(base)
-                x_aug1  = _TO_TENSOR_NORM(self.wca_aug(base))  # 独立 WCA ×2
-                x_aug2  = _TO_TENSOR_NORM(self.wca_aug(base))
+                aug1_pil = self.wca_aug(base)
+                # basis_random=True のとき aug2 が aug1 と同じペアにならないよう引き直す
+                _last = getattr(self.wca_aug, '_last_pair', None)
+                aug2_pil = self.wca_aug(base, avoid_pair=_last) if _last is not None \
+                           else self.wca_aug(base)
+                x_aug1 = _TO_TENSOR_NORM(aug1_pil)
+                x_aug2 = _TO_TENSOR_NORM(aug2_pil)
             else:  # wca_first
-                x_clean = _TO_TENSOR_NORM(_BASIC_AUG(img))
-                x_aug1  = _TO_TENSOR_NORM(_BASIC_AUG(self.wca_aug(img)))
-                x_aug2  = _TO_TENSOR_NORM(_BASIC_AUG(self.wca_aug(img)))
+                x_clean  = _TO_TENSOR_NORM(_BASIC_AUG(img))
+                aug1_pil = self.wca_aug(img)
+                _last    = getattr(self.wca_aug, '_last_pair', None)
+                aug2_pil = self.wca_aug(img, avoid_pair=_last) if _last is not None \
+                           else self.wca_aug(img)
+                x_aug1 = _TO_TENSOR_NORM(_BASIC_AUG(aug1_pil))
+                x_aug2 = _TO_TENSOR_NORM(_BASIC_AUG(aug2_pil))
             return (x_clean, x_aug1, x_aug2), label
 
 
@@ -134,11 +143,13 @@ def build_loaders(args, eval_mode=False):
     wca_aug = None
     if args.aug == 'wca':
         from core.wca import WaveletBasisSwap
+        basis_random = getattr(args, 'basis_random', False)
         wca_aug = WaveletBasisSwap(
             source_wavelet=args.source,
             target_wavelet=args.target,
             level=args.level,
             swap_prob=args.swap_prob,
+            basis_random=basis_random,
         )
     elif args.aug == 'augmix':
         from torchvision.transforms import AugMix
