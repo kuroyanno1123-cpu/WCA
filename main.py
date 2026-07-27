@@ -32,7 +32,8 @@ parser.add_argument('--memo',    type=str, default='none')
 
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
-                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'],
+                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls',
+                             'apr-s-orig', 'apr-s-orig-cls'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -142,22 +143,24 @@ def main():
         else:
             print(f'aug={args.aug}  source={args.source}  target={args.target}  '
                   f'level={args.level}  swap_prob={args.swap_prob}')
-    elif args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'):
+    elif args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig', 'apr-s-orig-cls'):
         print(f'aug={args.aug}')
         if args.aug == 'apr-s-soft':
             print(f't_max={args.t_max}  label_k={args.label_k}  clean_prob={args.clean_prob}')
-        elif args.aug == 'apr-s-cls':
+        elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
             print(f'gamma_swap={args.gamma_swap}  uncond_smooth={args.uncond_smooth}')
         elif args.aug == 'apr-s':
             print(f'[APR-S] apply_prob=0.5 (matching gary23ai/APR original)')
         elif args.aug == 'apr-s-orig':
             print('[APR-S-orig] faithful port: same-image 2-view FFT recombination, no clip, uint8 overflow')
+        elif args.aug == 'apr-s-orig-cls':
+            print('[APR-S-orig-cls] faithful port + conditional label smoothing on swapped samples')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')
-    if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'):
+    if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig', 'apr-s-orig-cls'):
         from datasets.apr_soft import build_apr_loaders
         train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
     else:
@@ -183,6 +186,12 @@ def main():
         )
     elif args.aug == 'apr-s-orig':
         file_name = f'{args.model}_{args.dataset}_{args.aug}_{args.memo}'
+    elif args.aug == 'apr-s-orig-cls':
+        file_name = (
+            f'{args.model}_{args.dataset}_{args.aug}'
+            f'_gs{args.gamma_swap}_us{args.uncond_smooth}'
+            f'_{args.memo}'
+        )
     else:
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
@@ -216,7 +225,7 @@ def main():
     csv_path   = osp.join(args.outfolder, 'history.csv')
     if args.aug == 'apr-s-soft':
         _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std')
-    elif args.aug == 'apr-s-cls':
+    elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
         _apr_extra_headers = ('swap_rate', 'gamma_mean')
     else:
         _apr_extra_headers = ()
@@ -262,7 +271,7 @@ def main():
                 losses.get('t_mean'), losses.get('t_std'),
                 losses.get('gamma_mean'), losses.get('gamma_std'),
             )
-        elif args.aug == 'apr-s-cls':
+        elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
             _apr_extra_vals = (losses.get('swap_rate'), losses.get('gamma_mean'))
         else:
             _apr_extra_vals = ()
@@ -324,8 +333,8 @@ def _train_epoch(net, optimizer, loader):
             'gamma_mean': float(gamma_arr.mean()), 'gamma_std': float(gamma_arr.std()),
         }
 
-    elif args.aug == 'apr-s-cls':
-        # ── APR-S-cls モード (条件付きラベルスムージング) ─────────────────────
+    elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
+        # ── APR-S-cls / APR-S-orig-cls モード (条件付きラベルスムージング) ─────
         # dataset が (x_aug, y_own, swapped) を返す
         C = 10
         total_swapped = 0

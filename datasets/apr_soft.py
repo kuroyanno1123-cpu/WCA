@@ -190,22 +190,21 @@ class APRHardDataset(Dataset):
 
 # ── APR-S-orig: 原実装 APRecombination 忠実移植 ──────────────────────────────
 
-def _apr_orig_call(x: Image.Image) -> Image.Image:
-    """gary23ai/APR の APRecombination.__call__ と同一ロジック。
+def _apr_orig_core(x: Image.Image):
+    """APRecombination の共通コア。PIL image と swapped フラグを返す。
 
-    バイト一致保証のため原コードの挙動をそのまま再現:
-    - np.random.choice で aug を選択 (np.random)
-    - p = random.uniform(0, 1) (Python random)
-    - x.copy() に別 aug を適用 (distractor は別画像でない)
-    - 2 方向からランダム選択 (p>0.5: amp1+phase2, else: amp2+phase1)
-    - clip なし、astype(uint8) のオーバーフロー挙動を再現
+    swapped=False: p>0.5 で早期リターン (FFT 再結合なし)
+    swapped=True:  FFT 振幅・位相の再結合を適用
+
+    既存の _apr_orig_call はこの関数を薄くラップするだけで、
+    バイト一致テストへの影響はない。
     """
     op = np.random.choice(_ORIG_AUG_LIST)
     x = op(x, 3)
 
     p = random.uniform(0, 1)
     if p > 0.5:
-        return x
+        return x, False   # early return: no amplitude recombination
 
     x_aug = x.copy()
     op = np.random.choice(_ORIG_AUG_LIST)
@@ -230,7 +229,21 @@ def _apr_orig_call(x: Image.Image) -> Image.Image:
         out = np.fft.ifftn(np.fft.ifftshift(fft_2))
 
     out = out.astype(np.uint8)   # no clip: overflow/wraparound as original
-    return Image.fromarray(out)
+    return Image.fromarray(out), True
+
+
+def _apr_orig_call(x: Image.Image) -> Image.Image:
+    """gary23ai/APR の APRecombination.__call__ と同一ロジック。
+
+    バイト一致保証のため原コードの挙動をそのまま再現:
+    - np.random.choice で aug を選択 (np.random)
+    - p = random.uniform(0, 1) (Python random)
+    - x.copy() に別 aug を適用 (distractor は別画像でない)
+    - 2 方向からランダム選択 (p>0.5: amp1+phase2, else: amp2+phase1)
+    - clip なし、astype(uint8) のオーバーフロー挙動を再現
+    """
+    img, _ = _apr_orig_core(x)
+    return img
 
 
 class APROrigDataset(Dataset):
@@ -254,6 +267,30 @@ class APROrigDataset(Dataset):
         return x_tensor, y_own
 
 
+class APROrigClsDataset(Dataset):
+    """APR-S-orig + 条件付きラベルスムージング (apr-s-orig-cls)。
+
+    _apr_orig_core でスワップフラグを取得し:
+      swapped=True:  y_soft = (1-γ)·one_hot(y_own) + γ/C
+      swapped=False: 通常 CE (y_soft = one_hot(y_own))
+
+    返り値: (x_tensor, y_own, swapped: BoolTensor)
+    """
+
+    def __init__(self, root, download=True):
+        self._raw = _RawCIFAR10(root, train=True, download=download)
+        self._n   = len(self._raw)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, idx):
+        img, y_own = self._raw[idx]
+        img, swapped = _apr_orig_core(img)
+        x_tensor = _APR_ORIG_POST(img)
+        return x_tensor, y_own, torch.tensor(swapped, dtype=torch.bool)
+
+
 # ── DataLoader ファクトリ ──────────────────────────────────────────────────────
 
 def build_apr_loaders(args, eval_mode=False):
@@ -271,6 +308,8 @@ def build_apr_loaders(args, eval_mode=False):
         train_ds = APRHardDataset(data_root, return_flag=True)
     elif args.aug == 'apr-s-orig':
         train_ds = APROrigDataset(data_root)
+    elif args.aug == 'apr-s-orig-cls':
+        train_ds = APROrigClsDataset(data_root)
     else:  # apr-s
         train_ds = APRHardDataset(data_root)
 

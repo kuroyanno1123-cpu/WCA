@@ -267,24 +267,74 @@ def test_regression_apr_s_orig():
     _forward_one_batch('apr-s-orig')
 
 
+# ── Test 9: apr-s-orig-cls のフラグが内部ゲートと対応している ──────────────────
+
+def test_orig_cls_swapped_flag():
+    """_apr_orig_core の swapped フラグが p>0.5 ゲートと正しく対応することを確認。
+
+    p>0.5 (早期リターン) → swapped=False
+    p≤0.5 (FFT 再結合)  → swapped=True
+    """
+    from PIL import Image as _PIL_Image
+    from datasets.apr_soft import _apr_orig_core
+
+    rng_pairs = [(42, 0), (7, 1), (123, 2), (999, 3)]
+    for py_seed, np_seed in rng_pairs:
+        img = _PIL_Image.fromarray(
+            np.random.RandomState(np_seed).randint(0, 256, (32, 32, 3), dtype=np.uint8)
+        )
+        # 10 回試行して True/False 両方出ることを確認
+        results = []
+        for i in range(10):
+            random.seed(py_seed + i)
+            np.random.seed(np_seed + i)
+            _, swapped = _apr_orig_core(img.copy())
+            results.append(swapped)
+
+        assert any(results),     f'seed={py_seed}: swapped=True が一度も出なかった'
+        assert not all(results), f'seed={py_seed}: swapped=False が一度も出なかった'
+
+
+def test_orig_cls_not_swapped_is_onehot():
+    """apr-s-orig-cls: swapped=False のとき y_soft == one_hot。"""
+    C, bs = 10, 8
+    y_own   = torch.randint(0, C, (bs,))
+    swapped = torch.zeros(bs, dtype=torch.bool)
+    gamma_swap = 0.1
+
+    y_one_hot = F.one_hot(y_own, C).float()
+    y_smooth  = (1 - gamma_swap) * y_one_hot + gamma_swap / C
+    mask      = swapped.float().unsqueeze(1)
+    y_soft    = mask * y_smooth + (1 - mask) * y_one_hot
+
+    assert torch.allclose(y_soft, y_one_hot), 'not-swapped must equal one_hot'
+
+
+def test_regression_apr_s_orig_cls():
+    _forward_one_batch('apr-s-orig-cls', gamma_swap=0.1, uncond_smooth=0.0)
+
+
 # ── テストランナー ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     tests = [
-        ('test_identity_at_t0',             test_identity_at_t0),
-        ('test_t1_matches_hard_swap',        test_t1_matches_hard_swap),
-        ('test_gamma_formula',               test_gamma_formula),
-        ('test_y_soft_sums_to_one',          test_y_soft_sums_to_one),
-        ('test_regression_wca_ce',           test_regression_wca_ce),
-        ('test_regression_wca_jsd',          test_regression_wca_jsd),
-        ('test_regression_augmix',           test_regression_augmix),
-        ('test_regression_apr_s',            test_regression_apr_s),
-        ('test_regression_apr_s_soft',       test_regression_apr_s_soft),
-        ('test_cls_not_swapped_is_onehot',   test_cls_not_swapped_is_onehot),
-        ('test_cls_swapped_label_values',    test_cls_swapped_label_values),
-        ('test_regression_apr_s_cls',        test_regression_apr_s_cls),
-        ('test_orig_byte_exact_match',       test_orig_byte_exact_match),
-        ('test_regression_apr_s_orig',       test_regression_apr_s_orig),
+        ('test_identity_at_t0',               test_identity_at_t0),
+        ('test_t1_matches_hard_swap',          test_t1_matches_hard_swap),
+        ('test_gamma_formula',                 test_gamma_formula),
+        ('test_y_soft_sums_to_one',            test_y_soft_sums_to_one),
+        ('test_regression_wca_ce',             test_regression_wca_ce),
+        ('test_regression_wca_jsd',            test_regression_wca_jsd),
+        ('test_regression_augmix',             test_regression_augmix),
+        ('test_regression_apr_s',              test_regression_apr_s),
+        ('test_regression_apr_s_soft',         test_regression_apr_s_soft),
+        ('test_cls_not_swapped_is_onehot',     test_cls_not_swapped_is_onehot),
+        ('test_cls_swapped_label_values',      test_cls_swapped_label_values),
+        ('test_regression_apr_s_cls',          test_regression_apr_s_cls),
+        ('test_orig_byte_exact_match',         test_orig_byte_exact_match),
+        ('test_regression_apr_s_orig',         test_regression_apr_s_orig),
+        ('test_orig_cls_swapped_flag',         test_orig_cls_swapped_flag),
+        ('test_orig_cls_not_swapped_is_onehot',test_orig_cls_not_swapped_is_onehot),
+        ('test_regression_apr_s_orig_cls',     test_regression_apr_s_orig_cls),
     ]
 
     passed, failed = 0, 0
