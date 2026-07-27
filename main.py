@@ -32,7 +32,8 @@ parser.add_argument('--memo',    type=str, default='none')
 
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
-                    choices=['wca', 'augmix', 'none'], help='augmentation type')
+                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft'],
+                    help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
 parser.add_argument('--level',     type=int,   default=1,      help='DWT decomposition level')
@@ -44,6 +45,14 @@ parser.add_argument('--aug-order', type=str,   default=None,
 parser.add_argument('--basis-random', action='store_true', default=False,
                     help='Randomize (source, target) wavelet pair per sample from BASIS_POOL. '
                          'Requires --aug wca. Ignores --source/--target when enabled.')
+
+# APR-S-soft specific
+parser.add_argument('--t-max',      type=float, default=1.0,
+                    help='APR-S-soft: upper bound of amplitude mixing ratio (default 1.0)')
+parser.add_argument('--label-k',    type=float, default=1.0,
+                    help='APR-S-soft: label schedule exponent k. gamma=(t_eff)^k (default 1.0)')
+parser.add_argument('--clean-prob', type=float, default=0.0,
+                    help='APR-S-soft: probability of forcing t=0 (clean pass) per sample')
 
 # loss
 parser.add_argument('--jsd-lambda', type=float, default=12.0,
@@ -87,15 +96,16 @@ sys.stdout = Logger(osp.join(args.outfolder, 'logs.txt'))
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
 
-def _csv_init(path):
+def _csv_init(path, extra_headers=()):
     if not osp.exists(path):
         with open(path, 'w', newline='') as f:
             csv.writer(f).writerow(
                 ['epoch', 'lr', 'loss_total', 'loss_ce', 'loss_jsd', 'test_acc']
+                + list(extra_headers)
             )
 
 
-def _csv_append(path, epoch, lr, losses, acc):
+def _csv_append(path, epoch, lr, losses, acc, extra_vals=()):
     with open(path, 'a', newline='') as f:
         csv.writer(f).writerow([
             epoch,
@@ -104,7 +114,7 @@ def _csv_append(path, epoch, lr, losses, acc):
             f'{losses["ce"]:.6f}',
             f'{losses["jsd"]:.6f}' if losses['jsd'] is not None else '',
             f'{acc:.5f}'           if acc is not None             else '',
-        ])
+        ] + [f'{v:.6f}' if v is not None else '' for v in extra_vals])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -128,12 +138,21 @@ def main():
         else:
             print(f'aug={args.aug}  source={args.source}  target={args.target}  '
                   f'level={args.level}  swap_prob={args.swap_prob}')
+    elif args.aug in ('apr-s', 'apr-s-soft'):
+        print(f'aug={args.aug}')
+        if args.aug == 'apr-s-soft':
+            print(f't_max={args.t_max}  label_k={args.label_k}  clean_prob={args.clean_prob}')
+        print(f'[APR-S] apply_prob=0.5 (matching gary23ai/APR original)')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')
-    train_loader, test_loader, corruption_loaders = build_loaders(args, eval_mode=eval_mode)
+    if args.aug in ('apr-s', 'apr-s-soft'):
+        from datasets.apr_soft import build_apr_loaders
+        train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
+    else:
+        train_loader, test_loader, corruption_loaders = build_loaders(args, eval_mode=eval_mode)
 
     from model.resnet import ResNet18
     net = ResNet18(num_classes=10)
@@ -141,11 +160,18 @@ def main():
     n_params = sum(p.numel() for p in net.parameters())
     print(f'Parameters: {n_params:,}')
 
-    file_name = (
-        f'{args.model}_{args.dataset}_{args.aug}'
-        f'_src{args.source}_tgt{args.target}_l{args.level}_p{args.swap_prob}'
-        f'_jsd{args.jsd_lambda}_{args.memo}'
-    )
+    if args.aug in ('apr-s', 'apr-s-soft'):
+        file_name = (
+            f'{args.model}_{args.dataset}_{args.aug}'
+            f'_tmax{args.t_max}_k{args.label_k}_cp{args.clean_prob}'
+            f'_{args.memo}'
+        )
+    else:
+        file_name = (
+            f'{args.model}_{args.dataset}_{args.aug}'
+            f'_src{args.source}_tgt{args.target}_l{args.level}_p{args.swap_prob}'
+            f'_jsd{args.jsd_lambda}_{args.memo}'
+        )
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     if eval_mode:
@@ -171,7 +197,9 @@ def main():
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 190], gamma=0.2)
 
     csv_path   = osp.join(args.outfolder, 'history.csv')
-    _csv_init(csv_path)
+    _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std') \
+                         if args.aug == 'apr-s-soft' else ()
+    _csv_init(csv_path, extra_headers=_apr_extra_headers)
     best_acc   = 0.0
     start_time = time.time()
 
@@ -183,6 +211,10 @@ def main():
         if losses['jsd'] is not None:
             print(f'epoch_loss: {losses["total"]:.6f}  '
                   f'CE: {losses["ce"]:.6f}  JSD(pre-λ): {losses["jsd"]:.6f}')
+        elif losses.get('t_mean') is not None:
+            print(f'epoch_loss: {losses["total"]:.6f}  '
+                  f't={losses["t_mean"]:.3f}±{losses["t_std"]:.3f}  '
+                  f'γ={losses["gamma_mean"]:.3f}±{losses["gamma_std"]:.3f}')
         else:
             print(f'epoch_loss: {losses["total"]:.6f}')
 
@@ -200,7 +232,11 @@ def main():
         scheduler.step()
         lr_now = scheduler.get_last_lr()[0]
         print(f'lr: {lr_now:.6f}  epoch_time(min): {(time.time() - t0) // 60}')
-        _csv_append(csv_path, epoch + 1, lr_now, losses, acc)
+        _apr_extra_vals = (
+            losses.get('t_mean'), losses.get('t_std'),
+            losses.get('gamma_mean'), losses.get('gamma_std'),
+        ) if args.aug == 'apr-s-soft' else ()
+        _csv_append(csv_path, epoch + 1, lr_now, losses, acc, extra_vals=_apr_extra_vals)
 
     elapsed = str(datetime.timedelta(seconds=round(time.time() - start_time)))
     print(f'Finished. Total elapsed time (h:m:s): {elapsed}')
@@ -213,7 +249,75 @@ def _train_epoch(net, optimizer, loader):
     meter_ce  = AverageMeter()
     meter_jsd = AverageMeter()
 
-    if args.jsd_lambda > 0:
+    if args.aug == 'apr-s-soft':
+        # ── APR-S-soft モード ─────────────────────────────────────────────────
+        # dataset が (x_aug, t_eff, y_own, y_dist) を返す
+        C = 10  # CIFAR-10
+        t_vals, gamma_vals = [], []
+
+        for batch_idx, (x_aug, t_eff, y_own, y_dist) in enumerate(loader):
+            x_aug  = x_aug.cuda()
+            t_eff  = t_eff.cuda()    # (bs,)
+            y_own  = y_own.cuda()
+            y_dist = y_dist.cuda()
+            bs     = x_aug.size(0)
+
+            gamma  = t_eff ** args.label_k   # (bs,)
+            y_soft = (
+                (1 - gamma).unsqueeze(1) * F.one_hot(y_own,  C).float()
+                + gamma.unsqueeze(1)     * F.one_hot(y_dist, C).float()
+            )  # (bs, C)
+
+            logits = net(x_aug)
+            loss   = -(y_soft * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+            optimizer.step()
+
+            meter.update(loss.item(), bs)
+            t_vals.extend(t_eff.detach().cpu().tolist())
+            gamma_vals.extend(gamma.detach().cpu().tolist())
+
+            if (batch_idx + 1) % args.print_freq == 0:
+                print(f'Batch {batch_idx + 1}/{len(loader)}\t'
+                      f'Loss {meter.val:.6f} ({meter.avg:.6f})  '
+                      f't={t_eff.mean():.3f}  γ={gamma.mean():.3f}')
+
+        t_arr     = np.array(t_vals)
+        gamma_arr = np.array(gamma_vals)
+        return {
+            'total': meter.avg, 'ce': meter.avg, 'jsd': None,
+            't_mean': float(t_arr.mean()),     't_std': float(t_arr.std()),
+            'gamma_mean': float(gamma_arr.mean()), 'gamma_std': float(gamma_arr.std()),
+        }
+
+    elif args.aug == 'apr-s':
+        # ── APR-S モード (通常 CE) ────────────────────────────────────────────
+        # dataset が (x_aug, y_own) を返す
+        for batch_idx, (inputs, targets) in enumerate(loader):
+            inputs  = inputs.cuda()
+            targets = targets.cuda()
+
+            logits = net(inputs)
+            loss   = F.cross_entropy(logits, targets)
+
+            optimizer.zero_grad()
+            loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+            optimizer.step()
+
+            meter.update(loss.item(), targets.size(0))
+            if (batch_idx + 1) % args.print_freq == 0:
+                print(f'Batch {batch_idx + 1}/{len(loader)}\t'
+                      f'Loss {meter.val:.6f} ({meter.avg:.6f})')
+
+        return {'total': meter.avg, 'ce': meter.avg, 'jsd': None}
+
+    elif args.jsd_lambda > 0:
         # ── JSD モード ───────────────────────────────────────────────────────
         # dataset が ((x_clean, x_aug1, x_aug2), y) を返す
         for batch_idx, ((x_clean, x_aug1, x_aug2), targets) in enumerate(loader):
