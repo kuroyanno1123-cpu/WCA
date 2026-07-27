@@ -13,6 +13,13 @@ APR-S-soft (提案手法):
   - ラベル: gamma = (t*t_max)^k で soft label を計算
   - E[t] = 0.5 = APR-S の期待混合強度と一致
 
+APR-S-orig (原実装忠実版, gary23ai/APR APRecombination):
+  - image-space aug 2種を同一画像に適用して2つのビューを生成
+  - 両ビューのFFT振幅・位相を再結合 (2方向ランダム選択)
+  - distractor は別画像ではなく x.copy() に別 aug を適用したもの
+  - clip なし, astype(uint8) のオーバーフロー挙動を完全再現
+  - 原実装順序: APRecombination → RandomCrop → RandomHorizontalFlip → ToTensor
+
 FFT の流儀: gary23ai/APR に合わせ np.fft.fftn (H×W×C の 3D FFT) + fftshift を使用。
 t_eff=1 のとき APR-S hard swap と数値的に一致する。
 """
@@ -23,12 +30,25 @@ from PIL import Image
 import os
 
 import torch
+from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 
 from datasets.cifar import (
     _RawCIFAR10, _BASIC_AUG, _TO_TENSOR_NORM,
     _worker_init_fn, CIFAR10TestDataset, CIFAR10CDataset, CORRUPTION_TYPES,
 )
+import datasets.augmentations_orig as _aug_orig_mod
+
+# aug_list は原実装と同一の 9 演算
+_ORIG_AUG_LIST = _aug_orig_mod.augmentations
+
+# APROrigDataset 用 post-APR 変換 (crop → flip → tensor → normalize)
+_APR_ORIG_POST = transforms.Compose([
+    transforms.RandomCrop(32, padding=4, fill=128),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]),
+])
 
 
 # ── FFT 振幅混合 ──────────────────────────────────────────────────────────────
@@ -168,10 +188,76 @@ class APRHardDataset(Dataset):
         return x_tensor, y_own
 
 
+# ── APR-S-orig: 原実装 APRecombination 忠実移植 ──────────────────────────────
+
+def _apr_orig_call(x: Image.Image) -> Image.Image:
+    """gary23ai/APR の APRecombination.__call__ と同一ロジック。
+
+    バイト一致保証のため原コードの挙動をそのまま再現:
+    - np.random.choice で aug を選択 (np.random)
+    - p = random.uniform(0, 1) (Python random)
+    - x.copy() に別 aug を適用 (distractor は別画像でない)
+    - 2 方向からランダム選択 (p>0.5: amp1+phase2, else: amp2+phase1)
+    - clip なし、astype(uint8) のオーバーフロー挙動を再現
+    """
+    op = np.random.choice(_ORIG_AUG_LIST)
+    x = op(x, 3)
+
+    p = random.uniform(0, 1)
+    if p > 0.5:
+        return x
+
+    x_aug = x.copy()
+    op = np.random.choice(_ORIG_AUG_LIST)
+    x_aug = op(x_aug, 3)
+
+    x_np     = np.array(x).astype(np.uint8)
+    x_aug_np = np.array(x_aug).astype(np.uint8)
+
+    fft_1 = np.fft.fftshift(np.fft.fftn(x_np))
+    fft_2 = np.fft.fftshift(np.fft.fftn(x_aug_np))
+
+    abs_1, angle_1 = np.abs(fft_1), np.angle(fft_1)
+    abs_2, angle_2 = np.abs(fft_2), np.angle(fft_2)
+
+    fft_1 = abs_1 * np.exp(1j * angle_2)   # amp(x) + phase(x_aug)
+    fft_2 = abs_2 * np.exp(1j * angle_1)   # amp(x_aug) + phase(x)
+
+    p = random.uniform(0, 1)
+    if p > 0.5:
+        out = np.fft.ifftn(np.fft.ifftshift(fft_1))
+    else:
+        out = np.fft.ifftn(np.fft.ifftshift(fft_2))
+
+    out = out.astype(np.uint8)   # no clip: overflow/wraparound as original
+    return Image.fromarray(out)
+
+
+class APROrigDataset(Dataset):
+    """APR-S 原実装忠実版 (gary23ai/APR APRecombination を完全再現)。
+
+    原実装順序: APRecombination → RandomCrop(32, pad=4) → HFlip → ToTensor → Normalize
+    ラベル: y_own のみ (CE), 返り値は (x_tensor, y_own)
+    """
+
+    def __init__(self, root, download=True):
+        self._raw = _RawCIFAR10(root, train=True, download=download)
+        self._n   = len(self._raw)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, idx):
+        img, y_own = self._raw[idx]            # PIL 32×32
+        img = _apr_orig_call(img)              # APRecombination (PIL → PIL)
+        x_tensor = _APR_ORIG_POST(img)         # crop → flip → tensor → normalize
+        return x_tensor, y_own
+
+
 # ── DataLoader ファクトリ ──────────────────────────────────────────────────────
 
 def build_apr_loaders(args, eval_mode=False):
-    """APR-S / APR-S-soft 用 DataLoader を構築する。"""
+    """APR-S / APR-S-soft / APR-S-orig 用 DataLoader を構築する。"""
     data_root = os.path.join(args.data, 'cifar10')
 
     if args.aug == 'apr-s-soft':
@@ -183,6 +269,8 @@ def build_apr_loaders(args, eval_mode=False):
         )
     elif args.aug == 'apr-s-cls':
         train_ds = APRHardDataset(data_root, return_flag=True)
+    elif args.aug == 'apr-s-orig':
+        train_ds = APROrigDataset(data_root)
     else:  # apr-s
         train_ds = APRHardDataset(data_root)
 

@@ -209,6 +209,64 @@ def test_regression_apr_s_cls():
     _forward_one_batch('apr-s-cls', gamma_swap=0.1, uncond_smooth=0.0)
 
 
+# ── Test 8: apr-s-orig がバイト一致で原実装と一致する ──────────────────────────
+
+def test_orig_byte_exact_match():
+    """_apr_orig_call が同一シードで原実装 APRecombination.__call__ と完全一致することを確認。
+
+    原実装: /home/kairisasaki/APR/datasets/APR.py
+    """
+    import importlib.util, pathlib
+    from PIL import Image
+
+    # 原実装を動的インポート (WCA の augmentations_orig を上書きしないよう別名)
+    orig_aug_path = pathlib.Path('/home/kairisasaki/APR/datasets/augmentations.py')
+    spec_aug = importlib.util.spec_from_file_location('_orig_augmentations', orig_aug_path)
+    orig_aug_mod = importlib.util.module_from_spec(spec_aug)
+    spec_aug.loader.exec_module(orig_aug_mod)
+
+    orig_apr_path = pathlib.Path('/home/kairisasaki/APR/datasets/APR.py')
+    spec_apr = importlib.util.spec_from_file_location('_orig_APR', orig_apr_path)
+    orig_apr_mod = importlib.util.module_from_spec(spec_apr)
+    # APR.py は `import datasets.augmentations as augmentations` しているが、
+    # 動的ロードなので sys.modules に追加して解決する
+    sys.modules['datasets.augmentations'] = orig_aug_mod
+    spec_apr.loader.exec_module(orig_apr_mod)
+
+    OrigAPR = orig_apr_mod.APRecombination
+    orig_recomb = OrigAPR(img_size=32)
+
+    from datasets.apr_soft import _apr_orig_call
+
+    # 固定シードで 10 枚テスト
+    rng_states = [(seed, seed * 31337 % (2**32 - 1)) for seed in range(10)]
+
+    for py_seed, np_seed in rng_states:
+        # 固定画像を生成 (シードごとに同一)
+        np.random.seed(np_seed)
+        img_arr = np.random.randint(0, 256, (32, 32, 3), dtype=np.uint8)
+        img_pil  = Image.fromarray(img_arr)
+        img_pil2 = img_pil.copy()
+
+        # 原実装
+        random.seed(py_seed);  np.random.seed(np_seed)
+        out_orig = np.array(orig_recomb(img_pil))
+
+        # 移植版
+        random.seed(py_seed);  np.random.seed(np_seed)
+        out_ours = np.array(_apr_orig_call(img_pil2))
+
+        assert np.array_equal(out_orig, out_ours), (
+            f'seed={py_seed}: max diff = {np.max(np.abs(out_orig.astype(int) - out_ours.astype(int)))}\n'
+            f'orig[:5,:5,0] = {out_orig[:5,:5,0]}\n'
+            f'ours[:5,:5,0] = {out_ours[:5,:5,0]}'
+        )
+
+
+def test_regression_apr_s_orig():
+    _forward_one_batch('apr-s-orig')
+
+
 # ── テストランナー ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -225,6 +283,8 @@ if __name__ == '__main__':
         ('test_cls_not_swapped_is_onehot',   test_cls_not_swapped_is_onehot),
         ('test_cls_swapped_label_values',    test_cls_swapped_label_values),
         ('test_regression_apr_s_cls',        test_regression_apr_s_cls),
+        ('test_orig_byte_exact_match',       test_orig_byte_exact_match),
+        ('test_regression_apr_s_orig',       test_regression_apr_s_orig),
     ]
 
     passed, failed = 0, 0

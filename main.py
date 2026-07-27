@@ -32,7 +32,7 @@ parser.add_argument('--memo',    type=str, default='none')
 
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
-                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls'],
+                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -142,19 +142,22 @@ def main():
         else:
             print(f'aug={args.aug}  source={args.source}  target={args.target}  '
                   f'level={args.level}  swap_prob={args.swap_prob}')
-    elif args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls'):
+    elif args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'):
         print(f'aug={args.aug}')
         if args.aug == 'apr-s-soft':
             print(f't_max={args.t_max}  label_k={args.label_k}  clean_prob={args.clean_prob}')
         elif args.aug == 'apr-s-cls':
             print(f'gamma_swap={args.gamma_swap}  uncond_smooth={args.uncond_smooth}')
-        print(f'[APR-S] apply_prob=0.5 (matching gary23ai/APR original)')
+        elif args.aug == 'apr-s':
+            print(f'[APR-S] apply_prob=0.5 (matching gary23ai/APR original)')
+        elif args.aug == 'apr-s-orig':
+            print('[APR-S-orig] faithful port: same-image 2-view FFT recombination, no clip, uint8 overflow')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')
-    if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls'):
+    if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig'):
         from datasets.apr_soft import build_apr_loaders
         train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
     else:
@@ -178,6 +181,8 @@ def main():
             f'_gs{args.gamma_swap}_us{args.uncond_smooth}'
             f'_{args.memo}'
         )
+    elif args.aug == 'apr-s-orig':
+        file_name = f'{args.model}_{args.dataset}_{args.aug}_{args.memo}'
     else:
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
@@ -369,8 +374,8 @@ def _train_epoch(net, optimizer, loader):
         return {'total': meter.avg, 'ce': meter.avg, 'jsd': None,
                 'swap_rate': swap_rate, 'gamma_mean': gamma_mean}
 
-    elif args.aug == 'apr-s':
-        # ── APR-S モード (通常 CE) ────────────────────────────────────────────
+    elif args.aug in ('apr-s', 'apr-s-orig'):
+        # ── APR-S / APR-S-orig モード (通常 CE) ──────────────────────────────
         # dataset が (x_aug, y_own) を返す
         for batch_idx, (inputs, targets) in enumerate(loader):
             inputs  = inputs.cuda()
