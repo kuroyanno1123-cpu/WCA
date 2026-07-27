@@ -32,7 +32,7 @@ parser.add_argument('--memo',    type=str, default='none')
 
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
-                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft'],
+                    choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -53,6 +53,10 @@ parser.add_argument('--label-k',    type=float, default=1.0,
                     help='APR-S-soft: label schedule exponent k. gamma=(t_eff)^k (default 1.0)')
 parser.add_argument('--clean-prob', type=float, default=0.0,
                     help='APR-S-soft: probability of forcing t=0 (clean pass) per sample')
+parser.add_argument('--gamma-swap',    type=float, default=0.1,
+                    help='APR-S-cls: label smoothing gamma for swapped samples')
+parser.add_argument('--uncond-smooth', type=float, default=0.0,
+                    help='APR-S-cls: >0 applies uniform smoothing to ALL samples (ablation)')
 
 # loss
 parser.add_argument('--jsd-lambda', type=float, default=12.0,
@@ -138,17 +142,19 @@ def main():
         else:
             print(f'aug={args.aug}  source={args.source}  target={args.target}  '
                   f'level={args.level}  swap_prob={args.swap_prob}')
-    elif args.aug in ('apr-s', 'apr-s-soft'):
+    elif args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls'):
         print(f'aug={args.aug}')
         if args.aug == 'apr-s-soft':
             print(f't_max={args.t_max}  label_k={args.label_k}  clean_prob={args.clean_prob}')
+        elif args.aug == 'apr-s-cls':
+            print(f'gamma_swap={args.gamma_swap}  uncond_smooth={args.uncond_smooth}')
         print(f'[APR-S] apply_prob=0.5 (matching gary23ai/APR original)')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
 
     eval_mode = (args.eval == 'eval')
-    if args.aug in ('apr-s', 'apr-s-soft'):
+    if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls'):
         from datasets.apr_soft import build_apr_loaders
         train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
     else:
@@ -160,10 +166,16 @@ def main():
     n_params = sum(p.numel() for p in net.parameters())
     print(f'Parameters: {n_params:,}')
 
-    if args.aug in ('apr-s', 'apr-s-soft'):
+    if args.aug == 'apr-s-soft':
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
             f'_tmax{args.t_max}_k{args.label_k}_cp{args.clean_prob}'
+            f'_{args.memo}'
+        )
+    elif args.aug in ('apr-s', 'apr-s-cls'):
+        file_name = (
+            f'{args.model}_{args.dataset}_{args.aug}'
+            f'_gs{args.gamma_swap}_us{args.uncond_smooth}'
             f'_{args.memo}'
         )
     else:
@@ -197,8 +209,12 @@ def main():
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 190], gamma=0.2)
 
     csv_path   = osp.join(args.outfolder, 'history.csv')
-    _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std') \
-                         if args.aug == 'apr-s-soft' else ()
+    if args.aug == 'apr-s-soft':
+        _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std')
+    elif args.aug == 'apr-s-cls':
+        _apr_extra_headers = ('swap_rate', 'gamma_mean')
+    else:
+        _apr_extra_headers = ()
     _csv_init(csv_path, extra_headers=_apr_extra_headers)
     best_acc   = 0.0
     start_time = time.time()
@@ -215,6 +231,10 @@ def main():
             print(f'epoch_loss: {losses["total"]:.6f}  '
                   f't={losses["t_mean"]:.3f}±{losses["t_std"]:.3f}  '
                   f'γ={losses["gamma_mean"]:.3f}±{losses["gamma_std"]:.3f}')
+        elif losses.get('swap_rate') is not None:
+            print(f'epoch_loss: {losses["total"]:.6f}  '
+                  f'swap_rate={losses["swap_rate"]:.3f}  '
+                  f'γ_mean={losses["gamma_mean"]:.4f}')
         else:
             print(f'epoch_loss: {losses["total"]:.6f}')
 
@@ -232,10 +252,15 @@ def main():
         scheduler.step()
         lr_now = scheduler.get_last_lr()[0]
         print(f'lr: {lr_now:.6f}  epoch_time(min): {(time.time() - t0) // 60}')
-        _apr_extra_vals = (
-            losses.get('t_mean'), losses.get('t_std'),
-            losses.get('gamma_mean'), losses.get('gamma_std'),
-        ) if args.aug == 'apr-s-soft' else ()
+        if args.aug == 'apr-s-soft':
+            _apr_extra_vals = (
+                losses.get('t_mean'), losses.get('t_std'),
+                losses.get('gamma_mean'), losses.get('gamma_std'),
+            )
+        elif args.aug == 'apr-s-cls':
+            _apr_extra_vals = (losses.get('swap_rate'), losses.get('gamma_mean'))
+        else:
+            _apr_extra_vals = ()
         _csv_append(csv_path, epoch + 1, lr_now, losses, acc, extra_vals=_apr_extra_vals)
 
     elapsed = str(datetime.timedelta(seconds=round(time.time() - start_time)))
@@ -293,6 +318,56 @@ def _train_epoch(net, optimizer, loader):
             't_mean': float(t_arr.mean()),     't_std': float(t_arr.std()),
             'gamma_mean': float(gamma_arr.mean()), 'gamma_std': float(gamma_arr.std()),
         }
+
+    elif args.aug == 'apr-s-cls':
+        # ── APR-S-cls モード (条件付きラベルスムージング) ─────────────────────
+        # dataset が (x_aug, y_own, swapped) を返す
+        C = 10
+        total_swapped = 0
+        total_samples = 0
+
+        for batch_idx, (x_aug, y_own, swapped) in enumerate(loader):
+            x_aug   = x_aug.cuda()
+            y_own   = y_own.cuda()
+            swapped = swapped.cuda()   # (bs,) bool
+            bs      = x_aug.size(0)
+
+            y_one_hot = F.one_hot(y_own, C).float()
+
+            if args.uncond_smooth > 0.0:
+                # 全サンプルに一律スムージング (対照実験用)
+                y_soft = (1 - args.uncond_smooth) * y_one_hot + args.uncond_smooth / C
+            else:
+                # スワップしたサンプルのみ γ=gamma_swap、それ以外は one_hot
+                y_smooth = (1 - args.gamma_swap) * y_one_hot + args.gamma_swap / C
+                mask     = swapped.float().unsqueeze(1)  # (bs, 1)
+                y_soft   = mask * y_smooth + (1 - mask) * y_one_hot
+
+            logits = net(x_aug)
+            loss   = -(y_soft * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+            optimizer.step()
+
+            meter.update(loss.item(), bs)
+            total_swapped += int(swapped.sum().item())
+            total_samples += bs
+
+            if (batch_idx + 1) % args.print_freq == 0:
+                sr = swapped.float().mean().item()
+                print(f'Batch {batch_idx + 1}/{len(loader)}\t'
+                      f'Loss {meter.val:.6f} ({meter.avg:.6f})  swap={sr:.2f}')
+
+        swap_rate = total_swapped / total_samples if total_samples > 0 else 0.0
+        if args.uncond_smooth > 0.0:
+            gamma_mean = args.uncond_smooth
+        else:
+            gamma_mean = swap_rate * args.gamma_swap
+        return {'total': meter.avg, 'ce': meter.avg, 'jsd': None,
+                'swap_rate': swap_rate, 'gamma_mean': gamma_mean}
 
     elif args.aug == 'apr-s':
         # ── APR-S モード (通常 CE) ────────────────────────────────────────────

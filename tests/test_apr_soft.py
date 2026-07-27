@@ -93,6 +93,7 @@ def _make_args(**kwargs):
         aug='wca', source='haar', target='db8', level=1, swap_prob=0.2,
         jsd_lambda=0.0, aug_order='wca_first', basis_random=False,
         t_max=1.0, label_k=1.0, clean_prob=0.0,
+        gamma_swap=0.1, uncond_smooth=0.0,
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -105,7 +106,7 @@ def _forward_one_batch(aug_name, **extra):
 
     args = _make_args(aug=aug_name, **extra)
 
-    if aug_name in ('apr-s', 'apr-s-soft'):
+    if aug_name in ('apr-s', 'apr-s-soft', 'apr-s-cls'):
         loader, _, _ = build_apr_loaders(args, eval_mode=False)
     else:
         loader, _, _ = build_loaders(args, eval_mode=False)
@@ -122,6 +123,15 @@ def _forward_one_batch(aug_name, **extra):
             (1 - gamma).unsqueeze(1) * F.one_hot(y_own,  C).float()
             + gamma.unsqueeze(1)     * F.one_hot(y_dist, C).float()
         )
+        loss = -(y_soft * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+    elif aug_name == 'apr-s-cls':
+        x_aug, y_own, swapped = batch
+        C = 10
+        y_one_hot = F.one_hot(y_own, C).float()
+        y_smooth  = (1 - args.gamma_swap) * y_one_hot + args.gamma_swap / C
+        mask      = swapped.float().unsqueeze(1)
+        y_soft    = mask * y_smooth + (1 - mask) * y_one_hot
+        logits = net(x_aug)
         loss = -(y_soft * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
     elif aug_name == 'apr-s':
         x_aug, y_own = batch
@@ -160,6 +170,45 @@ def test_regression_apr_s_soft():
     _forward_one_batch('apr-s-soft', t_max=1.0, label_k=1.0, clean_prob=0.0)
 
 
+# ── Test 6: apr-s-cls swapped=False → y_soft == one_hot ──────────────────────
+
+def test_cls_not_swapped_is_onehot():
+    C, bs = 10, 8
+    y_own   = torch.randint(0, C, (bs,))
+    swapped = torch.zeros(bs, dtype=torch.bool)
+    gamma_swap = 0.1
+
+    y_one_hot = F.one_hot(y_own, C).float()
+    y_smooth  = (1 - gamma_swap) * y_one_hot + gamma_swap / C
+    mask      = swapped.float().unsqueeze(1)
+    y_soft    = mask * y_smooth + (1 - mask) * y_one_hot
+
+    assert torch.allclose(y_soft, y_one_hot), 'not-swapped samples must equal one_hot'
+
+
+# ── Test 7: apr-s-cls swapped=True → 行和=1, 正解確率=1-γ+γ/C ───────────────
+
+def test_cls_swapped_label_values():
+    C, bs = 10, 8
+    gamma_swap = 0.1
+    y_own   = torch.zeros(bs, dtype=torch.long)   # 全サンプルクラス0
+    swapped = torch.ones(bs, dtype=torch.bool)
+
+    y_one_hot = F.one_hot(y_own, C).float()
+    y_smooth  = (1 - gamma_swap) * y_one_hot + gamma_swap / C
+    mask      = swapped.float().unsqueeze(1)
+    y_soft    = mask * y_smooth + (1 - mask) * y_one_hot
+
+    expected_correct = 1 - gamma_swap + gamma_swap / C
+    assert torch.allclose(y_soft.sum(dim=1), torch.ones(bs), atol=1e-6), '行和が1でない'
+    assert torch.allclose(y_soft[:, 0], torch.full((bs,), expected_correct), atol=1e-6), \
+        f'正解クラス確率: expected {expected_correct:.4f}, got {y_soft[0, 0]:.4f}'
+
+
+def test_regression_apr_s_cls():
+    _forward_one_batch('apr-s-cls', gamma_swap=0.1, uncond_smooth=0.0)
+
+
 # ── テストランナー ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -173,6 +222,9 @@ if __name__ == '__main__':
         ('test_regression_augmix',           test_regression_augmix),
         ('test_regression_apr_s',            test_regression_apr_s),
         ('test_regression_apr_s_soft',       test_regression_apr_s_soft),
+        ('test_cls_not_swapped_is_onehot',   test_cls_not_swapped_is_onehot),
+        ('test_cls_swapped_label_values',    test_cls_swapped_label_values),
+        ('test_regression_apr_s_cls',        test_regression_apr_s_cls),
     ]
 
     passed, failed = 0, 0

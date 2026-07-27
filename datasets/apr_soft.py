@@ -125,16 +125,20 @@ class APRHardDataset(Dataset):
     適用なし時は元画像 (Crop/Flip のみ) を返す。
     APR-S の期待混合強度 E[effective_t] = apply_prob * 1.0 = 0.5。
 
-    __getitem__ が返すもの: (x_aug, y_own)
+    return_flag=False: (x_aug, y_own)          ← apr-s 用
+    return_flag=True:  (x_aug, y_own, swapped)  ← apr-s-cls 用
+      swapped: bool tensor, スワップが実際に適用されたか
     """
 
     # 原実装の適用確率 (gary23ai/APR: `if p > 0.5: return x`)
     DEFAULT_APPLY_PROB = 0.5
 
-    def __init__(self, root, apply_prob=DEFAULT_APPLY_PROB, download=True):
-        self._raw       = _RawCIFAR10(root, train=True, download=download)
-        self.apply_prob = apply_prob
-        self._n         = len(self._raw)
+    def __init__(self, root, apply_prob=DEFAULT_APPLY_PROB,
+                 return_flag=False, download=True):
+        self._raw        = _RawCIFAR10(root, train=True, download=download)
+        self.apply_prob  = apply_prob
+        self.return_flag = return_flag
+        self._n          = len(self._raw)
 
     def __len__(self):
         return self._n
@@ -143,6 +147,7 @@ class APRHardDataset(Dataset):
         img, y_own = self._raw[idx]
         img_aug = _BASIC_AUG(img)
 
+        swapped = False
         if random.random() < self.apply_prob:
             dist_idx = random.randrange(self._n - 1)
             if dist_idx >= idx:
@@ -154,9 +159,12 @@ class APRHardDataset(Dataset):
                 np.array(img_aug), np.array(img_dist_aug), 1.0  # hard swap: t_eff=1
             )
             x_tensor = _TO_TENSOR_NORM(Image.fromarray(mixed))
+            swapped = True
         else:
             x_tensor = _TO_TENSOR_NORM(img_aug)
 
+        if self.return_flag:
+            return x_tensor, y_own, torch.tensor(swapped, dtype=torch.bool)
         return x_tensor, y_own
 
 
@@ -173,6 +181,8 @@ def build_apr_loaders(args, eval_mode=False):
             label_k=args.label_k,
             clean_prob=args.clean_prob,
         )
+    elif args.aug == 'apr-s-cls':
+        train_ds = APRHardDataset(data_root, return_flag=True)
     else:  # apr-s
         train_ds = APRHardDataset(data_root)
 
