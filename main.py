@@ -33,7 +33,7 @@ parser.add_argument('--memo',    type=str, default='none')
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
                     choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls',
-                             'apr-s-orig', 'apr-s-orig-cls'],
+                             'apr-s-orig', 'apr-s-orig-cls', 'wf-sign', 'wf-max'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -58,6 +58,14 @@ parser.add_argument('--gamma-swap',    type=float, default=0.1,
                     help='APR-S-cls: label smoothing gamma for swapped samples')
 parser.add_argument('--uncond-smooth', type=float, default=0.0,
                     help='APR-S-cls: >0 applies uniform smoothing to ALL samples (ablation)')
+
+# WaveletFusion specific
+parser.add_argument('--wf-wavelet',    type=str,   default='haar',
+                    help='WaveletFusion: pywt wavelet basis (default haar)')
+parser.add_argument('--wf-level',      type=int,   default=1,
+                    help='WaveletFusion: decomposition level (default 1)')
+parser.add_argument('--wf-apply-prob', type=float, default=0.5,
+                    help='WaveletFusion: probability of applying fusion per sample (default 0.5)')
 
 # loss
 parser.add_argument('--jsd-lambda', type=float, default=12.0,
@@ -155,6 +163,9 @@ def main():
             print('[APR-S-orig] faithful port: same-image 2-view FFT recombination, no clip, uint8 overflow')
         elif args.aug == 'apr-s-orig-cls':
             print('[APR-S-orig-cls] faithful port + conditional label smoothing on swapped samples')
+    elif args.aug in ('wf-sign', 'wf-max'):
+        print(f'aug={args.aug}  wf_wavelet={args.wf_wavelet}  '
+              f'wf_level={args.wf_level}  wf_apply_prob={args.wf_apply_prob}')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
@@ -163,6 +174,9 @@ def main():
     if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig', 'apr-s-orig-cls'):
         from datasets.apr_soft import build_apr_loaders
         train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
+    elif args.aug in ('wf-sign', 'wf-max'):
+        from datasets.wavelet_fusion import build_wf_loaders
+        train_loader, test_loader, corruption_loaders = build_wf_loaders(args, eval_mode=eval_mode)
     else:
         train_loader, test_loader, corruption_loaders = build_loaders(args, eval_mode=eval_mode)
 
@@ -190,6 +204,12 @@ def main():
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
             f'_gs{args.gamma_swap}_us{args.uncond_smooth}'
+            f'_{args.memo}'
+        )
+    elif args.aug in ('wf-sign', 'wf-max'):
+        file_name = (
+            f'{args.model}_{args.dataset}_{args.aug}'
+            f'_wv{args.wf_wavelet}_l{args.wf_level}_p{args.wf_apply_prob}'
             f'_{args.memo}'
         )
     else:
@@ -227,6 +247,8 @@ def main():
         _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std')
     elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
         _apr_extra_headers = ('swap_rate', 'gamma_mean')
+    elif args.aug in ('wf-sign', 'wf-max'):
+        _apr_extra_headers = ('apply_rate',)
     else:
         _apr_extra_headers = ()
     _csv_init(csv_path, extra_headers=_apr_extra_headers)
@@ -273,6 +295,8 @@ def main():
             )
         elif args.aug in ('apr-s-cls', 'apr-s-orig-cls'):
             _apr_extra_vals = (losses.get('swap_rate'), losses.get('gamma_mean'))
+        elif args.aug in ('wf-sign', 'wf-max'):
+            _apr_extra_vals = (losses.get('apply_rate'),)
         else:
             _apr_extra_vals = ()
         _csv_append(csv_path, epoch + 1, lr_now, losses, acc, extra_vals=_apr_extra_vals)
@@ -382,6 +406,37 @@ def _train_epoch(net, optimizer, loader):
             gamma_mean = swap_rate * args.gamma_swap
         return {'total': meter.avg, 'ce': meter.avg, 'jsd': None,
                 'swap_rate': swap_rate, 'gamma_mean': gamma_mean}
+
+    elif args.aug in ('wf-sign', 'wf-max'):
+        # ── WaveletFusion モード (CE, apply_rate ログ) ────────────────────────
+        # dataset が (x_aug, y_own, applied: bool) を返す
+        total_applied = 0
+        total_samples = 0
+
+        for batch_idx, (x_aug, y_own, applied) in enumerate(loader):
+            x_aug   = x_aug.cuda()
+            y_own   = y_own.cuda()
+            bs      = x_aug.size(0)
+
+            logits = net(x_aug)
+            loss   = F.cross_entropy(logits, y_own)
+
+            optimizer.zero_grad()
+            loss.backward()
+            if args.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+            optimizer.step()
+
+            meter.update(loss.item(), bs)
+            total_applied += int(applied.sum().item())
+            total_samples += bs
+
+            if (batch_idx + 1) % args.print_freq == 0:
+                print(f'Batch {batch_idx + 1}/{len(loader)}\t'
+                      f'Loss {meter.val:.6f} ({meter.avg:.6f})')
+
+        apply_rate = total_applied / total_samples if total_samples > 0 else 0.0
+        return {'total': meter.avg, 'ce': meter.avg, 'jsd': None, 'apply_rate': apply_rate}
 
     elif args.aug in ('apr-s', 'apr-s-orig'):
         # ── APR-S / APR-S-orig モード (通常 CE) ──────────────────────────────
