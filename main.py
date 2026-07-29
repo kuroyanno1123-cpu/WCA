@@ -105,6 +105,10 @@ parser.add_argument('--grad-clip',  type=float, default=None,
 
 args = parser.parse_args()
 
+# APR-AAG は独自の JSD を管理するため、グローバル jsd_lambda は無効化
+if args.aug == 'apr-aag':
+    args.jsd_lambda = 0.0
+
 # ── Aug-order default: wca_first for CE, crop_first for JSD ──────────────────
 if args.aug_order is None:
     args.aug_order = 'crop_first' if args.jsd_lambda > 0 else 'wca_first'
