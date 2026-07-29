@@ -33,7 +33,7 @@ parser.add_argument('--memo',    type=str, default='none')
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
                     choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls',
-                             'apr-s-orig', 'apr-s-orig-cls', 'wf-sign', 'wf-max'],
+                             'apr-s-orig', 'apr-s-orig-cls', 'wf-sign', 'wf-max', 'apr-aag'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -58,6 +58,16 @@ parser.add_argument('--gamma-swap',    type=float, default=0.1,
                     help='APR-S-cls: label smoothing gamma for swapped samples')
 parser.add_argument('--uncond-smooth', type=float, default=0.0,
                     help='APR-S-cls: >0 applies uniform smoothing to ALL samples (ablation)')
+
+# AAG (Adversarial Amplitude Generator) specific
+parser.add_argument('--aag-mix-beta',   type=float, default=1.0,
+                    help='AAG: upper bound of per-sample beta ~ U(0, mix_beta) (default 1.0)')
+parser.add_argument('--aag-jsd-weight', type=float, default=0.0,
+                    help='AAG: JSD consistency loss weight (0=CE-only, DAT=2.0)')
+parser.add_argument('--aag-g-lr',       type=float, default=0.1,
+                    help='AAG: generator SGD lr (DAT default 0.1)')
+parser.add_argument('--aag-z-dim',      type=int,   default=100,
+                    help='AAG: noise vector dimension (default 100)')
 
 # WaveletFusion specific
 parser.add_argument('--wf-wavelet',    type=str,   default='haar',
@@ -166,6 +176,9 @@ def main():
     elif args.aug in ('wf-sign', 'wf-max'):
         print(f'aug={args.aug}  wf_wavelet={args.wf_wavelet}  '
               f'wf_level={args.wf_level}  wf_apply_prob={args.wf_apply_prob}')
+    elif args.aug == 'apr-aag':
+        print(f'aug=apr-aag  jsd_weight={args.aag_jsd_weight}  '
+              f'mix_beta={args.aag_mix_beta}  g_lr={args.aag_g_lr}  z_dim={args.aag_z_dim}')
     else:
         print(f'aug={args.aug}')
     print(f'jsd_lambda={args.jsd_lambda}  aug_order={args.aug_order}  grad_clip={args.grad_clip}')
@@ -178,6 +191,7 @@ def main():
         from datasets.wavelet_fusion import build_wf_loaders
         train_loader, test_loader, corruption_loaders = build_wf_loaders(args, eval_mode=eval_mode)
     else:
+        # apr-aag も標準 DataLoader を使う (振幅操作はバッチループ内で実施)
         train_loader, test_loader, corruption_loaders = build_loaders(args, eval_mode=eval_mode)
 
     from model.resnet import ResNet18
@@ -212,6 +226,12 @@ def main():
             f'_wv{args.wf_wavelet}_l{args.wf_level}_p{args.wf_apply_prob}'
             f'_{args.memo}'
         )
+    elif args.aug == 'apr-aag':
+        file_name = (
+            f'{args.model}_{args.dataset}_apr-aag'
+            f'_jsd{args.aag_jsd_weight}_mb{args.aag_mix_beta}'
+            f'_{args.memo}'
+        )
     else:
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
@@ -242,6 +262,18 @@ def main():
                                 momentum=0.9, nesterov=True, weight_decay=5e-4)
     scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160, 190], gamma=0.2)
 
+    # AAG generator (apr-aag のみ)
+    aag_G, aag_optim_G, aag_scheduler_G = None, None, None
+    if args.aug == 'apr-aag':
+        from core.aag import GeneratorMLP
+        aag_G = GeneratorMLP(z_dim=args.aag_z_dim).cuda()
+        aag_optim_G = torch.optim.SGD(
+            aag_G.parameters(), lr=args.aag_g_lr, momentum=0.9, weight_decay=5e-4)
+        aag_scheduler_G = lr_scheduler.MultiStepLR(
+            aag_optim_G, milestones=[60, 120, 160, 190], gamma=0.2)
+        n_g = sum(p.numel() for p in aag_G.parameters())
+        print(f'AAG Generator parameters: {n_g:,}')
+
     csv_path   = osp.join(args.outfolder, 'history.csv')
     if args.aug == 'apr-s-soft':
         _apr_extra_headers = ('t_mean', 't_std', 'gamma_mean', 'gamma_std')
@@ -249,6 +281,8 @@ def main():
         _apr_extra_headers = ('swap_rate', 'gamma_mean')
     elif args.aug in ('wf-sign', 'wf-max'):
         _apr_extra_headers = ('apply_rate',)
+    elif args.aug == 'apr-aag':
+        _apr_extra_headers = ('g_loss', 'ce_base', 'ce_auto', 'jsd_raw')
     else:
         _apr_extra_headers = ()
     _csv_init(csv_path, extra_headers=_apr_extra_headers)
@@ -259,8 +293,18 @@ def main():
         t0 = time.time()
         print(f'==> Epoch {epoch + 1}/{args.max_epoch}')
 
-        losses = _train_epoch(net, optimizer, train_loader)
-        if losses['jsd'] is not None:
+        if args.aug == 'apr-aag':
+            losses = _train_epoch_aag(
+                net, optimizer, train_loader, aag_G, aag_optim_G, epoch)
+        else:
+            losses = _train_epoch(net, optimizer, train_loader)
+        if args.aug == 'apr-aag':
+            ce_diff = losses['ce_auto'] - losses['ce_base']
+            jsd_str = (f'  JSD={losses["jsd_raw"]:.4f}' if losses['jsd_raw'] is not None else '')
+            print(f'epoch_loss: {losses["total"]:.6f}  '
+                  f'CE_base={losses["ce_base"]:.6f}  CE_auto={losses["ce_auto"]:.6f}  '
+                  f'CE_diff={ce_diff:+.6f}  g_loss={losses["g_loss"]:.6f}{jsd_str}')
+        elif losses['jsd'] is not None:
             print(f'epoch_loss: {losses["total"]:.6f}  '
                   f'CE: {losses["ce"]:.6f}  JSD(pre-λ): {losses["jsd"]:.6f}')
         elif losses.get('t_mean') is not None:
@@ -286,6 +330,8 @@ def main():
                 save_networks(net, args.outfolder, file_name)
 
         scheduler.step()
+        if aag_scheduler_G is not None:
+            aag_scheduler_G.step()
         lr_now = scheduler.get_last_lr()[0]
         print(f'lr: {lr_now:.6f}  epoch_time(min): {(time.time() - t0) // 60}')
         if args.aug == 'apr-s-soft':
@@ -297,6 +343,11 @@ def main():
             _apr_extra_vals = (losses.get('swap_rate'), losses.get('gamma_mean'))
         elif args.aug in ('wf-sign', 'wf-max'):
             _apr_extra_vals = (losses.get('apply_rate'),)
+        elif args.aug == 'apr-aag':
+            _apr_extra_vals = (
+                losses.get('g_loss'), losses.get('ce_base'),
+                losses.get('ce_auto'), losses.get('jsd_raw'),
+            )
         else:
             _apr_extra_vals = ()
         _csv_append(csv_path, epoch + 1, lr_now, losses, acc, extra_vals=_apr_extra_vals)
@@ -518,6 +569,131 @@ def _train_epoch(net, optimizer, loader):
                       f'Loss {meter.val:.6f} ({meter.avg:.6f})')
 
         return {'total': meter.avg, 'ce': meter.avg, 'jsd': None}
+
+
+def _aag_compute_loss(logits_b, logits_a, y, jsd_weight):
+    """APR-AAG 用損失: (CE_base + CE_auto)/2 + jsd_weight * JSD。"""
+    ce_b  = F.cross_entropy(logits_b, y)
+    ce_a  = F.cross_entropy(logits_a, y)
+    total = (ce_b + ce_a) / 2
+    jsd_val = None
+    if jsd_weight > 0:
+        p_b = F.softmax(logits_b, dim=1)
+        p_a = F.softmax(logits_a, dim=1)
+        m   = torch.clamp((p_b + p_a) / 2., 1e-7, 1).log()
+        jsd_val = (F.kl_div(m, p_b, reduction='batchmean') +
+                   F.kl_div(m, p_a, reduction='batchmean')) / 2
+        total = total + jsd_weight * jsd_val
+    return total, ce_b, ce_a, jsd_val
+
+
+def _train_epoch_aag(net, optimizer, loader, aag_G, aag_optim_G, epoch):
+    """APR-AAG 学習エポック: DAT 公式の交互更新ループ (AT 機構なし)。
+
+    バッチごとに:
+      1. model.eval() で feat = model(x_base) を取得 (generator 条件付け)
+      2. G(z, feat) で振幅生成 → beta * amp_G + (1-beta) * amp_orig で混合
+      3. inverse_fft → clip → renorm で x_auto1 を構成
+      4. model 損失 = (CE_base + CE_auto)/2 + jsd_weight*JSD を backward(retain_graph)
+      5. g_loss = -(同損失の再計算) を G に backward
+    """
+    from core.aag import get_fft, inverse_fft, denorm, renorm
+    from torchvision.utils import save_image
+
+    net.train()
+    aag_G.train()
+
+    meter_total  = AverageMeter()
+    meter_ce_b   = AverageMeter()
+    meter_ce_a   = AverageMeter()
+    meter_jsd    = AverageMeter()
+    meter_g_loss = AverageMeter()
+
+    last_x_auto1_raw = None
+
+    for batch_idx, (x_base, y) in enumerate(loader):
+        x_base = x_base.cuda()
+        y      = y.cuda()
+        bs     = x_base.size(0)
+
+        # ── 1. 条件付け (DAT 公式通り eval mode, detach) ──────────────────────
+        net.eval()
+        with torch.no_grad():
+            feat = net(x_base)           # raw logits (B, 10)
+        net.train()
+
+        # ── 2. Generator forward ──────────────────────────────────────────────
+        z     = torch.randn(bs, args.aag_z_dim, device=x_base.device)
+        amp_G = aag_G(z, feat.detach()) # (B,3,32,32), [0,1]; G.params → amp_G
+
+        # ── 3. 振幅混合 (DAT 公式通り: [0,1] スケールの amp_G と生 FFT 振幅を混合) ──
+        x_raw            = denorm(x_base).detach()   # [0,1], no grad
+        amp_orig, pha_orig = get_fft(x_raw)          # no grad
+
+        beta1 = torch.from_numpy(
+            np.random.uniform(0, args.aag_mix_beta, (bs,)).astype(np.float32)
+        ).to(x_base.device).view(bs, 1, 1, 1)
+
+        amp_mixed    = beta1 * amp_G + (1 - beta1) * amp_orig  # grad via amp_G
+        x_auto1_raw  = inverse_fft(amp_mixed, pha_orig)        # [0,1], grad via amp_G
+        x_auto1      = renorm(x_auto1_raw)                     # normalized, grad via amp_G
+
+        last_x_auto1_raw = x_auto1_raw.detach().cpu()
+
+        # ── 4. Model update ───────────────────────────────────────────────────
+        logits_b = net(x_base)
+        logits_a = net(x_auto1)
+        loss, ce_b, ce_a, jsd_val = _aag_compute_loss(
+            logits_b, logits_a, y, args.aag_jsd_weight)
+
+        optimizer.zero_grad()
+        loss.backward(retain_graph=True)    # グラフ保持: g_loss のために必要
+        if args.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
+        optimizer.step()
+
+        # ── 5. Generator update (updated model で再 forward) ──────────────────
+        logits_b2 = net(x_base)
+        logits_a2 = net(x_auto1)           # x_auto1 → amp_G → G.params (retained)
+        g_loss_pos, _, _, _ = _aag_compute_loss(
+            logits_b2, logits_a2, y, args.aag_jsd_weight)
+        g_loss = -g_loss_pos               # G は model 損失を最大化
+
+        aag_optim_G.zero_grad()
+        g_loss.backward()
+        aag_optim_G.step()
+
+        # ── メータ ─────────────────────────────────────────────────────────────
+        meter_total.update(loss.item(), bs)
+        meter_ce_b.update(ce_b.item(),  bs)
+        meter_ce_a.update(ce_a.item(),  bs)
+        if jsd_val is not None:
+            meter_jsd.update(jsd_val.item(), bs)
+        meter_g_loss.update(g_loss_pos.item(), bs)   # 正値でログ
+
+        if (batch_idx + 1) % args.print_freq == 0:
+            ce_diff = ce_a.item() - ce_b.item()
+            print(f'Batch {batch_idx + 1}/{len(loader)}\t'
+                  f'Loss {meter_total.val:.4f} ({meter_total.avg:.4f})  '
+                  f'CE_base={ce_b.item():.4f}  CE_auto={ce_a.item():.4f}  '
+                  f'CE_diff={ce_diff:+.4f}  g_loss={g_loss_pos.item():.4f}')
+
+    # ── 10 エポックごとにサンプル画像保存 ────────────────────────────────────
+    if (epoch + 1) % 10 == 0 and last_x_auto1_raw is not None:
+        save_dir = osp.join(args.outfolder, 'aug_samples')
+        os.makedirs(save_dir, exist_ok=True)
+        save_image(last_x_auto1_raw[:8],
+                   osp.join(save_dir, f'ep{epoch + 1:03d}.png'), nrow=8)
+
+    return {
+        'total':   meter_total.avg,
+        'ce':      meter_ce_b.avg,
+        'jsd':     None,                  # legacy field
+        'g_loss':  meter_g_loss.avg,
+        'ce_base': meter_ce_b.avg,
+        'ce_auto': meter_ce_a.avg,
+        'jsd_raw': meter_jsd.avg if args.aag_jsd_weight > 0 else None,
+    }
 
 
 if __name__ == '__main__':
