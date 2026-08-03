@@ -33,7 +33,8 @@ parser.add_argument('--memo',    type=str, default='none')
 # augmentation
 parser.add_argument('--aug',       type=str,   default='wca',
                     choices=['wca', 'augmix', 'none', 'apr-s', 'apr-s-soft', 'apr-s-cls',
-                             'apr-s-orig', 'apr-s-orig-cls', 'wf-sign', 'wf-max', 'apr-aag'],
+                             'apr-s-orig', 'apr-s-orig-cls', 'wf-sign', 'wf-max', 'apr-aag',
+                             'wapr-orig'],
                     help='augmentation type')
 parser.add_argument('--source',    type=str,   default='haar', help='source wavelet')
 parser.add_argument('--target',    type=str,   default='db8',  help='target wavelet')
@@ -58,6 +59,21 @@ parser.add_argument('--gamma-swap',    type=float, default=0.1,
                     help='APR-S-cls: label smoothing gamma for swapped samples')
 parser.add_argument('--uncond-smooth', type=float, default=0.0,
                     help='APR-S-cls: >0 applies uniform smoothing to ALL samples (ablation)')
+
+# WaveletAPR (wapr-orig) specific
+parser.add_argument('--wapr-levels',              type=int,   default=3,
+                    help='wapr-orig: DTCWT decomposition levels J (default 3)')
+parser.add_argument('--wapr-lam',                 type=str,   default='1.0',
+                    help='wapr-orig: amplitude mix ratio. float or "uniform" (default 1.0)')
+parser.add_argument('--wapr-lowpass',             type=str,   default='amp',
+                    choices=['amp', 'phase', 'mix'],
+                    help='wapr-orig: lowpass subband treatment (default amp)')
+parser.add_argument('--wapr-phase-sigma-vital',   type=float, default=0.0,
+                    help='wapr-orig: phase perturbation sigma for vital coeffs (default 0.0=off)')
+parser.add_argument('--wapr-phase-sigma-nonvital',type=float, default=0.0,
+                    help='wapr-orig: phase perturbation sigma for non-vital coeffs (default 0.0=off)')
+parser.add_argument('--wapr-q-vital',             type=float, default=0.75,
+                    help='wapr-orig: quantile threshold for vital judgment (default 0.75)')
 
 # AAG (Adversarial Amplitude Generator) specific
 parser.add_argument('--aag-mix-beta',   type=float, default=1.0,
@@ -177,6 +193,9 @@ def main():
             print('[APR-S-orig] faithful port: same-image 2-view FFT recombination, no clip, uint8 overflow')
         elif args.aug == 'apr-s-orig-cls':
             print('[APR-S-orig-cls] faithful port + conditional label smoothing on swapped samples')
+    elif args.aug == 'wapr-orig':
+        print(f'aug=wapr-orig  J={args.wapr_levels}  lam={args.wapr_lam}  '
+              f'lowpass={args.wapr_lowpass}  phase_sigma_vital={args.wapr_phase_sigma_vital}')
     elif args.aug in ('wf-sign', 'wf-max'):
         print(f'aug={args.aug}  wf_wavelet={args.wf_wavelet}  '
               f'wf_level={args.wf_level}  wf_apply_prob={args.wf_apply_prob}')
@@ -191,6 +210,9 @@ def main():
     if args.aug in ('apr-s', 'apr-s-soft', 'apr-s-cls', 'apr-s-orig', 'apr-s-orig-cls'):
         from datasets.apr_soft import build_apr_loaders
         train_loader, test_loader, corruption_loaders = build_apr_loaders(args, eval_mode=eval_mode)
+    elif args.aug == 'wapr-orig':
+        from datasets.wapr import build_wapr_loaders
+        train_loader, test_loader, corruption_loaders = build_wapr_loaders(args, eval_mode=eval_mode)
     elif args.aug in ('wf-sign', 'wf-max'):
         from datasets.wavelet_fusion import build_wf_loaders
         train_loader, test_loader, corruption_loaders = build_wf_loaders(args, eval_mode=eval_mode)
@@ -218,6 +240,12 @@ def main():
         )
     elif args.aug == 'apr-s-orig':
         file_name = f'{args.model}_{args.dataset}_{args.aug}_{args.memo}'
+    elif args.aug == 'wapr-orig':
+        file_name = (
+            f'{args.model}_{args.dataset}_wapr-orig'
+            f'_J{args.wapr_levels}_lam{args.wapr_lam}_lp{args.wapr_lowpass}'
+            f'_{args.memo}'
+        )
     elif args.aug == 'apr-s-orig-cls':
         file_name = (
             f'{args.model}_{args.dataset}_{args.aug}'
@@ -493,8 +521,8 @@ def _train_epoch(net, optimizer, loader):
         apply_rate = total_applied / total_samples if total_samples > 0 else 0.0
         return {'total': meter.avg, 'ce': meter.avg, 'jsd': None, 'apply_rate': apply_rate}
 
-    elif args.aug in ('apr-s', 'apr-s-orig'):
-        # ── APR-S / APR-S-orig モード (通常 CE) ──────────────────────────────
+    elif args.aug in ('apr-s', 'apr-s-orig', 'wapr-orig'):
+        # ── APR-S / APR-S-orig / wapr-orig モード (通常 CE) ──────────────────
         # dataset が (x_aug, y_own) を返す
         for batch_idx, (inputs, targets) in enumerate(loader):
             inputs  = inputs.cuda()
